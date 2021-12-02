@@ -1,0 +1,747 @@
+---
+title: Exploratory analysis and predictive model development for inventory demand forecast.
+author: "Mario Peres"
+date: "October 20, 2021"
+output: pdf_document
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This project was developed as part of my studies at the course Big Data Analytics with R and Azure ML offerec by Data Science Academy. It was developed a predictive model to support the inventory demand forecast, based on the XGBoost algorithm.
+
+
+File descriptions:
+
+train.csv — the training set
+test.csv — the test set
+sample_submission.csv — a sample submission file in the correct format
+cliente_tabla.csv — client names (can be joined with train/test on Cliente_ID)
+producto_tabla.csv — product names (can be joined with train/test on Producto_ID)
+town_state.csv — town and state (can be joined with train/test on Agencia_ID)
+
+
+Data fields:
+
+Semana — Week number (From Thursday to Wednesday)
+Agencia_ID — Sales Depot ID
+Canal_ID — Sales Channel ID
+Ruta_SAK — Route ID (Several routes = Sales Depot)
+Cliente_ID — Client ID
+NombreCliente — Client name
+Producto_ID — Product ID
+NombreProducto — Product Name
+Venta_uni_hoy — Sales unit this week (integer)
+Venta_hoy — Sales this week (unit: pesos)
+Dev_uni_proxima — Returns unit next week (integer)
+Dev_proxima — Returns next week (unit: pesos)
+Demanda_uni_equil — Adjusted Demand (integer) (This is the target you will predict)
+
+Let's get started!!!
+
+First of all, let's load the packages that were used in this project and set seed, so someone can reproduce the results observed in this project.
+```{r}
+# Loading packages
+library(data.table)
+library(dplyr)
+library(plyr)
+library(ggplot2)
+
+library(caret)
+library(e1071)
+library(xgboost)
+
+# Setting seed
+set.seed(123)
+```
+Let's load the test data set (test.csv) and visualize it.
+```{r}
+# Loading data set test_data
+test_data <- fread('grupo-bimbo-inventory-demand/test.csv')
+
+# Visualizing the test_data
+head(test_data)
+```
+Based on the predictor variables present in the test data, the same variables were selected in the train data, as they will be the ones to be presented to our model.
+
+Loading train data and selecting the chosen variables.
+```{r}
+# Loading data set train_data
+train_data <- fread('grupo-bimbo-inventory-demand/train.csv') %>%
+  select(Semana, Agencia_ID, Canal_ID, Ruta_SAK, Cliente_ID, Producto_ID, Demanda_uni_equil)
+
+# Visualizing the train_data
+head(train_data)
+
+# Checking the dimension of the data set train_data
+dim(train_data)
+```
+As there are too many registers (> 74 million) in train_data, before we start doing the analysis and create the first version of the models, let's collect a sample of the train_data for fast processing and testing.
+```{r}
+# Creating the variable index
+train_data$index = c(1:length(train_data$Semana))
+
+# Sampling 100000 indexes to build the train_sample
+train_sample_index = sample(train_data$index, 100000, replace = FALSE)
+
+# Creating train_sample with all the registers contained the train_sample_index (Client_IDs)
+train_sample = train_data[train_sample_index,]
+
+# Removing the variable index, which was only used for sampling
+train_sample$index = NULL
+```
+So, the data set has reduced from about 74 million to 100 thousands observations. It will make the work faster with the smaller data set and draw the first conclusions. Later on, a larger part (10 million registers) of the original train data set was used to create the final version of the model.
+
+# PRELIMINARY EXPLORATORY ANALYSIS
+
+Let's perform a preliminary exploratory analysis to check the presence of NA values, to check data types of variables and transform them to the right type if necessary, to check unique values for each categorical variables, to check some descriptive statistics and to understand how the variables are distributed.
+
+Checking the presence of NA values.
+```{r}
+# Checking NA values
+sapply(colnames(train_sample), function(x) {sum(is.na(train_sample[,..x]))})
+```
+There are no NA values in our data set.
+
+Checking the data type for each variable in the train_data set.
+```{r}
+# Checking data type
+glimpse(train_sample)
+```
+All variables were recognized as numeric variables but a few of them should be transformed to categorical type.
+
+Variables that were transformed to categorical include:
+
+* Semana;
+* Agencia_ID;
+* Canal_ID;
+* Ruta_SAK;
+* Cliente_ID;
+* Producto_ID.
+```{r}
+# Transforming categorical variables
+train_sample = train_sample %>%
+  mutate(Semana = as.factor(Semana),
+         Agencia_ID = as.factor(Agencia_ID),
+         Canal_ID = as.factor(Canal_ID),
+         Ruta_SAK = as.factor(Ruta_SAK),
+         Cliente_ID = as.factor(Cliente_ID),
+         Producto_ID = as.factor(Producto_ID))
+```
+*Distribution of variables.*
+
+Checking distribution of the sum of Demanda_uni_equil by week and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Semana) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(data = temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum)
+
+train_sample %>%
+  group_by(Semana) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil)) %>%
+  ggplot() +
+  geom_bar(aes(x = Semana, y = sum, fill = Semana), stat = 'identity')
+```
+Checking distribution for Agencia_ID and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Agencia_ID) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+  geom_point(aes(total, sum)) +
+  geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum)
+  
+```
+Checking the distribution for Canal_ID and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Canal_ID) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+  geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum)
+  
+train_sample %>%
+  group_by(Canal_ID) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil)) %>%
+  ggplot() +
+  geom_bar(aes(x = Canal_ID, y = sum, fill = Canal_ID), stat = 'identity')
+```
+Checking distribution for Ruta_SAK and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Ruta_SAK) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) + 
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Cliente_ID and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Cliente_ID) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Producto_ID and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Producto_ID) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Cliente_ID and Producto_ID combined and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Agencia_ID, Ruta_SAK) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Cliente_ID and Producto_ID combined and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Agencia_ID, Cliente_ID) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Agencia_ID and Producto_ID combined and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Agencia_ID, Producto_ID) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Ruta_SAK and Cliente_ID combined and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Ruta_SAK, Cliente_ID) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Ruta_SAK and Producto_ID combined and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Ruta_SAK, Producto_ID) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Cliente_ID and Producto_ID combined and correlation.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Cliente_ID, Producto_ID) %>%
+  dplyr::summarise(sum = sum(Demanda_uni_equil),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  cor(temp$total, temp$sum,)
+```
+Checking distribution for Demanda_uni_equil using original and log10 scales.
+```{r }
+ggplot(train_sample) +
+  geom_histogram(aes(Demanda_uni_equil))
+
+ggplot(train_sample) +
+  geom_histogram(aes(Demanda_uni_equil)) +
+  scale_y_log10()
+```
+
+Let's try to convert the Demanda_uni_equil to log10 scale and check if the correlations are slightly improved or not.
+
+Checking distribution for Agencia_ID and correlation ## Log10.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Agencia_ID) %>%
+  dplyr::summarise(sum = sum(log10(Demanda_uni_equil)),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  temp = temp[temp$sum >= 0,]
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Ruta_SAK and correlation ## Log10.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Ruta_SAK) %>%
+  dplyr::summarise(sum = sum(log10(Demanda_uni_equil)),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  temp = temp[temp$sum >= 0,]
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Cliente_ID and correlation ## Log10.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Cliente_ID) %>%
+  dplyr::summarise(sum = sum(log10(Demanda_uni_equil)),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  temp = temp[temp$sum >= 0,]
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Producto_ID and correlation ## Log10.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Producto_ID) %>%
+  dplyr::summarise(sum = sum(log10(Demanda_uni_equil)),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  temp = temp[temp$sum >= 0,]
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Agencia_ID and Ruta_SAK combined and correlation ## Log10.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Agencia_ID, Ruta_SAK) %>%
+  dplyr::summarise(sum = sum(log10(Demanda_uni_equil)),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  temp = temp[temp$sum >= 0,]
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Agencia_ID and Cliente_ID combined and correlation ## Log10.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Agencia_ID, Cliente_ID) %>%
+  dplyr::summarise(sum = sum(log10(Demanda_uni_equil)),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  temp = temp[temp$sum >= 0,]
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Agencia_ID and Producto_ID combined and correlation ## Log10.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Agencia_ID, Producto_ID) %>%
+  dplyr::summarise(sum = sum(log10(Demanda_uni_equil)),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  temp = temp[temp$sum >= 0,]
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Ruta_SAK and Cliente_ID combined and correlation ## Log10.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Ruta_SAK, Cliente_ID) %>%
+  dplyr::summarise(sum = sum(log10(Demanda_uni_equil)),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  temp = temp[temp$sum >= 0,]
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Ruta_SAK and Producto_ID combined and correlation ## Log10.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Ruta_SAK, Producto_ID) %>%
+  dplyr::summarise(sum = sum(log10(Demanda_uni_equil)),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  temp = temp[temp$sum >= 0,]
+  cor(temp$total, temp$sum)
+```
+Checking distribution for Cliente_ID and Producto_ID combined and correlation ## Log10.
+```{r }
+temp = train_sample %>%
+  dplyr::group_by(Cliente_ID, Producto_ID) %>%
+  dplyr::summarise(sum = sum(log10(Demanda_uni_equil)),
+                   total = n()) %>%
+  dplyr::arrange(desc(sum))
+
+  ggplot(temp) +
+    geom_point(aes(total, sum)) +
+    geom_smooth(aes(total, sum), method = "lm")
+  
+  temp = temp[temp$sum >= 0,]
+  cor(temp$total, temp$sum)
+```
+
+From the analysis above, it is possible to see that the sum of the Demanda_uni_equil is proportional to the total number of times that the Agencia or Producto or Cliente, etc demanded something in the analysed period.
+
+Let's also change the target scale to log10, as it seems to have produced better results.
+
+# FEATURE ENGINEERING 
+
+Let's create a few new variables that counts the frequency in each category for each specific chosen categorical variable or group of variables.
+```{r}
+# Adding counts to some variables and group of variables
+train_sample = train_sample %>%
+  add_count(Semana) %>% dplyr::rename(Semana_n = n) %>%
+  add_count(Agencia_ID) %>% dplyr::rename(Agencia_n = n) %>%
+  add_count(Cliente_ID) %>% dplyr::rename(Cliente_n = n) %>%
+  add_count(Ruta_SAK) %>% dplyr::rename(Ruta_SAK_n = n) %>%
+  add_count(Producto_ID) %>% dplyr::rename(Producto_n = n) %>%
+  add_count(Ruta_SAK, Cliente_ID) %>% dplyr::rename(Ruta_SAK_Cliente_n = n) %>%
+  add_count(Ruta_SAK, Producto_ID) %>% dplyr::rename(Ruta_SAK_Producto_n = n) %>%
+  add_count(Agencia_ID, Ruta_SAK) %>% dplyr::rename(Agencia_Ruta_SAK_n = n) %>%
+  add_count(Agencia_ID, Cliente_ID) %>% dplyr::rename(Agencia_Cliente_n = n) %>%
+  add_count(Agencia_ID, Producto_ID) %>% dplyr::rename(Agencia_Producto_n = n) %>%
+  add_count(Cliente_ID, Producto_ID) %>% dplyr::rename(Cliente_Producto_n = n)
+```
+
+# EXPLORATORY ANALYSIS II
+
+Checking correlation among new variables and target as well as the unique values among categorical variables.
+```{r}
+# Checking correlation among numerical variables
+cor(train_sample[,c(7:18)])
+
+# Checking unique values 
+#sapply(colnames(train_sample[,c(1:6)]), function(x) {unique(train_sample[,..x])})
+
+# In order to avoid too many pages, this command was commented during the pdf preparation.
+```
+Most of categorical variables presents a lot of categories, with exception to Semana and Canal_ID, which presents 7 and 9 levels, respectively.
+
+As the mean values for Demanda_uni_equil for weeks 3 to 9 are very close to each other (uniform distribution of the means), this variable was not selected for modeling.
+
+Although there is a very strong correlation between the sum of demanda_uni_equil and Canal_ID, there is one channel that is kind of an outlier, meaning that most of the demand is attended by this canal and the sum of Demanda_uni_equil is much higher compared to the other channels. This variable may not be useful in the modeling either.
+
+According to the analyses above, let's remove one more variable from our train_sample set, which is the variable Cliente_n as it does not seems to be very useful for the model creation, as it is kind of an id for the data set.
+
+From the correlation analysis let's combine some predictors that are not very correlated to each other, but they are correlated to the target variable. In this case, two sets of predictors were chosen:
+
+- { Semana_n + Cliente_n + Agencia_n + Ruta_SAK_n }
+- { Semana_n + Ruta_SAK_Cliente_n + Agencia_n + Ruta_SAK_n + Producto_n + Agencia_Ruta_SAK_n }
+
+Before doing the changes, let's split the data set.
+
+# SPLIT DATA INTO TRAIN AND TEST SETS
+
+Let's split the train_sample into train and test.
+```{r}
+# Creating the index column
+train_sample$index = 1:length(train_sample$Semana_n)
+
+# Creating the train_index randomly to split the data
+train_index = sample(train_sample$index, 0.7 * length(train_sample$index), replace = FALSE)
+
+# Splitting the data into train and test sets
+train = train_sample[train_index,]
+test = train_sample[-train_index,]
+
+# Removing index column from train and test sets
+train$index = NULL
+test$index = NULL
+```
+Creating a new variable, named Demanda_uni_equil_log, holding the transformed values of Demanda_uni_equil to log (base 10) scale.
+```{r }
+# Creating the new variable Demanda_uni_equil_log based in log (base 10) scale transformation of the Demanda_uni_equil target.
+train= train %>%
+  mutate(Demanda_uni_equil_log = log10(Demanda_uni_equil)) %>%
+  select(-Demanda_uni_equil)
+```
+Standardizing the numeric variables of train_sample, with exception to the target variable. Two train sets were used to test the models, being one using the original data and the other with the standardized data.
+```{r }
+# Filter only the values higher or equal to 0 to remove a few -Inf values that were created during log transformation and standardize the numeric variables
+train = train %>% filter(Demanda_uni_equil_log >= 0)
+train_std = train
+train_std[,c(7:17)] = train_std[,c(7:17)] %>% mutate_if(is.numeric,scale)
+
+# Standardize the numeric variables
+test_std = test
+test_std[,c(8:18)] = test_std[,c(8:18)] %>% mutate_if(is.numeric,scale)
+```
+As the data is read for modeling, let's first create four version of linear models, based on the two different set of predictors and the two data sets (0riginal and standardized).
+```{r }
+## Linear Model
+
+# lm1 - target >> Semana_n + Cliente_n + Agencia_n + Ruta_SAK_n, using non-scaled numeric variables
+# Training the model with lm algorithm and making predictions
+lm1 = lm(Demanda_uni_equil_log ~ Semana_n + Cliente_n + Agencia_n + Ruta_SAK_n, data = train)
+pred_lm1 = predict(lm1, test[,c("Semana_n", "Cliente_n", "Agencia_n", "Ruta_SAK_n")])
+
+# Calculating the RMSE
+rmse_lm1 = RMSE(10**(pred_lm1), test$Demanda_uni_equil)
+rmse_lm1
+
+
+# lm2 - target >> Semana_n + Cliente_n + Agencia_n + Ruta_SAK_n, using scaled numeric variables
+# Training the model with lm algorithm and making predictions
+lm2 = lm(Demanda_uni_equil_log ~ Semana_n + Cliente_n + Agencia_n + Ruta_SAK_n, data = train_std)
+pred_lm2 = predict(lm2, test_std[,c("Semana_n", "Cliente_n", "Agencia_n", "Ruta_SAK_n")])
+
+# Calculating the RMSE
+rmse_lm2 = RMSE(10**(pred_lm2), test_std$Demanda_uni_equil)
+rmse_lm2
+
+
+# lm3 - target >> Semana_n + Ruta_saK_Cliente_n + Agencia_n + Ruta_SAK_n + Producto_n + Agencia_Ruta_SAK_n, using non-scaled numeric variables
+# Training the model with lm algorithm and making predictions
+lm3 = lm(Demanda_uni_equil_log ~ Semana_n + Ruta_SAK_Cliente_n + Agencia_n + Ruta_SAK_n + Producto_n + Agencia_Ruta_SAK_n, data = train)
+pred_lm3 = predict(lm3, test[,c("Semana_n", "Ruta_SAK_Cliente_n", "Agencia_n", "Ruta_SAK_n", "Producto_n", "Agencia_Ruta_SAK_n")])
+
+# Calculating the RMSE
+rmse_lm3 = RMSE(pred_lm3, test$Demanda_uni_equil)
+rmse_lm3
+
+
+# lm4 - target >> Semana_n + Ruta_saK_Cliente_n + Agencia_n + Ruta_SAK_n + Producto_n + Agencia_Ruta_SAK_n, using scaled numeric variables
+# Training the model with lm algorithm and making predictions
+lm4 = lm(Demanda_uni_equil_log ~ Semana_n + Ruta_SAK_Cliente_n + Agencia_n + Ruta_SAK_n + Producto_n + Agencia_Ruta_SAK_n, data = train_std)
+pred_lm4 = predict(lm3, test_std[,c("Semana_n", "Ruta_SAK_Cliente_n", "Agencia_n", "Ruta_SAK_n", "Producto_n", "Agencia_Ruta_SAK_n")])
+
+# Calculating the RMSE
+rmse_lm4 = RMSE(10**(pred_lm3), test_std$Demanda_uni_equil)
+rmse_lm4
+```
+
+```{r}
+## XGBoost
+
+# xgb1 - target >> Semana_n + Cliente_n + Agencia_n + Ruta_SAK_n, using non-scaled numeric variables
+# Data preparation for XGBoost - Creating the y_train1 (target) and dtrain1
+y_train1 = train$Demanda_uni_equil_log
+dtrain1 = xgb.DMatrix(as.matrix(train %>% select(Semana_n, Cliente_n, Agencia_n, Ruta_SAK_n)), label = y_train1)
+
+# Training the model with XGBoost algorithm and making predictions
+xgb1 = xgb.train(data = dtrain1, nrounds = 200, max_depth = 8, eta = 0.1)
+pred_xgb1 = predict(xgb1, as.matrix(test %>% select(Semana_n, Cliente_n, Agencia_n, Ruta_SAK_n)))
+
+# Calculating the RMSE
+rmse_xgb1 = RMSE(pred_xgb1, test$Demanda_uni_equil)
+rmse_xgb1
+
+
+# xgb2 - target >> Semana_n + Cliente_n + Agencia_n + Ruta_SAK_n, using scaled numeric variables
+# Data preparation for XGBoost - Creating the y_train1 (target) and dtrain1
+y_train2 = train_std$Demanda_uni_equil_log
+dtrain2 = xgb.DMatrix(as.matrix(train_std %>% select(Semana_n, Cliente_n, Agencia_n, Ruta_SAK_n)), label = y_train2)
+
+# Training the model with XGBoost algorithm and making predictions
+xgb2 = xgb.train(data = dtrain2, nrounds = 200, max_depth = 8, eta = 0.1)
+pred_xgb2 = predict(xgb2, as.matrix(test_std %>% select(Semana_n, Cliente_n, Agencia_n, Ruta_SAK_n)))
+
+# Calculating the RMSE
+rmse_xgb2 = RMSE(10**(pred_xgb2), test_std$Demanda_uni_equil)
+rmse_xgb2
+
+
+# xgb3 - target >> Semana_n + Ruta_saK_Cliente_n + Agencia_n + Ruta_SAK_n + Producto_n + Agencia_Ruta_SAK_n, using non-scaled numeric variables
+# Data preparation for XGBoost - Creating the y_train1 (target) and dtrain1
+y_train3 = train$Demanda_uni_equil_log
+dtrain3 = xgb.DMatrix(as.matrix(train %>% select(Semana_n, Ruta_SAK_Cliente_n, Agencia_n, Ruta_SAK_n, Producto_n, Agencia_Ruta_SAK_n)), label = y_train3)
+
+# Training the model with XGBoost algorithm and making predictions
+xgb3 = xgb.train(data = dtrain3, nrounds = 200, max_depth = 8, eta = 0.1)
+pred_xgb3 = predict(xgb3, as.matrix(test %>% select(Semana_n, Ruta_SAK_Cliente_n, Agencia_n, Ruta_SAK_n, Producto_n, Agencia_Ruta_SAK_n)))
+
+# Calculating the RMSE
+rmse_xgb3 = RMSE(pred_xgb3, test$Demanda_uni_equil)
+rmse_xgb3
+
+
+# xgb4 - target >> Semana_n + Ruta_saK_Cliente_n + Agencia_n + Ruta_SAK_n + Producto_n + Agencia_Ruta_SAK_n, using scaled numeric variables
+# Data preparation for XGBoost - Creating the y_train1 (target) and dtrain1
+y_train4 = train_std$Demanda_uni_equil_log
+dtrain4 = xgb.DMatrix(as.matrix(train_std %>% select(Semana_n, Ruta_SAK_Cliente_n, Agencia_n, Ruta_SAK_n, Producto_n, Agencia_Ruta_SAK_n)), label = y_train4)
+
+# Training the model with XGBoost algorithm and making predictions
+xgb4 = xgb.train(data = dtrain4, nrounds = 200, max_depth = 8, eta = 0.1)
+pred_xgb4 = predict(xgb4, as.matrix(test_std %>% select(Semana_n, Ruta_SAK_Cliente_n, Agencia_n, Ruta_SAK_n, Producto_n, Agencia_Ruta_SAK_n)))
+
+# Calculating the RMSE
+rmse_xgb4 = RMSE(10**(pred_xgb4), test_std$Demanda_uni_equil)
+rmse_xgb4
+
+# Free unused memory
+invisible(gc())
+```
+The best result, considering the lowest RMSE, was achieved with the scaled train set and considering the target variable in log (base 10) scale. The chosen model was model xgb4.
+
+
+Let's create the final version of the model as in xgb4, but using 10 million observations this time.
+```{r}
+# Sampling 10000000 indexes to build the train_sample
+train_sample_index = sample(train_data$index, 10000000, replace = FALSE)
+
+# Creating train_sample with all the registers contained the train_sample_index (Client_IDs)
+train_sample = train_data[train_sample_index,]
+
+# Removing the variable index, which was only used for sampling
+train_sample$index = NULL
+
+# Transforming categorical variables
+train_sample = train_sample %>%
+  mutate(Semana = as.factor(Semana),
+         Agencia_ID = as.factor(Agencia_ID),
+         Canal_ID = as.factor(Canal_ID),
+         Ruta_SAK = as.factor(Ruta_SAK),
+         Cliente_ID = as.factor(Cliente_ID),
+         Producto_ID = as.factor(Producto_ID))
+
+# Adding counts to some variables and group of variables
+train_sample = train_sample %>%
+  add_count(Semana) %>% dplyr::rename(Semana_n = n) %>%
+  add_count(Agencia_ID) %>% dplyr::rename(Agencia_n = n) %>%
+  add_count(Cliente_ID) %>% dplyr::rename(Cliente_n = n) %>%
+  add_count(Ruta_SAK) %>% dplyr::rename(Ruta_SAK_n = n) %>%
+  add_count(Producto_ID) %>% dplyr::rename(Producto_n = n) %>%
+  add_count(Ruta_SAK, Cliente_ID) %>% dplyr::rename(Ruta_SAK_Cliente_n = n) %>%
+  add_count(Agencia_ID, Ruta_SAK) %>% dplyr::rename(Agencia_Ruta_SAK_n = n)
+
+# Creating the index column
+train_sample$index = 1:length(train_sample$Semana_n)
+
+# Creating the train_index randomly to split the data
+train_index = sample(train_sample$index, 0.7 * length(train_sample$index), replace = FALSE)
+
+# Splitting the data into train and test sets
+train = train_sample[train_index,]
+test = train_sample[-train_index,]
+
+# Removing index column from train and test sets
+train$index = NULL
+test$index = NULL
+
+# Creating the new variable Demanda_uni_equil_log based in log (base 10) scale transformation of the Demanda_uni_equil target.
+train = train %>%
+  mutate(Demanda_uni_equil_log = log10(Demanda_uni_equil)) %>%
+  select(-Demanda_uni_equil)
+
+# Filter only the values higher or equal to 0 to remove a few -Inf values that were created during log transformation and standardize the numeric variables
+train = train %>% filter(Demanda_uni_equil_log >= 0)
+train_std = train
+train_std[,c(7:13)] = train_std[,c(7:13)] %>% mutate_if(is.numeric,scale)
+
+# Standardize the numeric variables
+test_std = test
+test_std[,c(7:13)] = test_std[,c(7:13)] %>% mutate_if(is.numeric,scale)
+
+# Creating the y_train1 (target) and dtrain1 for XGBoost algorithm
+y_train = train_std$Demanda_uni_equil_log
+dtrain = xgb.DMatrix(as.matrix(train_std %>% select(Semana_n, Ruta_SAK_Cliente_n, Agencia_n, Ruta_SAK_n, Producto_n, Agencia_Ruta_SAK_n)), label = y_train)
+
+# Training the model with XGBoost algorithm and making predictions
+xgb = xgb.train(data = dtrain, nrounds = 25, max_depth = 8, eta = 0.5)
+pred_xgb = predict(xgb, as.matrix(test_std %>% select(Semana_n, Ruta_SAK_Cliente_n, Agencia_n, Ruta_SAK_n, Producto_n, Agencia_Ruta_SAK_n)))
+
+# Calculating the RMSE
+rmse_xgb = RMSE(10**(pred_xgb), test_std$Demanda_uni_equil)
+rmse_xgb
+```
+
+
+
+
+
+
